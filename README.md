@@ -2,10 +2,6 @@
 
 A high-performance Write-Ahead Log (WAL) implementation in Go using memory-mapped I/O (mmap), designed for both writing at scale and reading at scale.
 
-## Description
-
-walfs implements a Write-Ahead Log using memory-mapped files, optimized for high-throughput writes and low-latency reads. It provides durability guarantees with built-in corruption detection and automatic crash recovery.
-
 **Key Features:**
 * Memory-mapped I/O for low-overhead random access
 * 8-byte aligned entries to support efficient page caching
@@ -68,9 +64,66 @@ func main() {
 
 ## Examples
 
+### Batch Writing
+
+The batch API allows you to write multiple records in a single operation.
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/ankur-anand/walfs"
+)
+
+func main() {
+    // Create a new WAL
+    wal, err := walfs.NewWALog("./data", ".wal")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer wal.Close()
+
+    // Prepare multiple records to write as a batch
+    records := [][]byte{
+        []byte("Transaction 1: User login"),
+        []byte("Transaction 2: Update profile"),
+        []byte("Transaction 3: Add to cart"),
+        []byte("Transaction 4: Process payment"),
+        []byte("Transaction 5: Send confirmation"),
+    }
+
+    // Write all records in a single batch operation
+    positions, err := wal.WriteBatch(records)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Printf("Successfully wrote %d records\n", len(positions))
+    for i, pos := range positions {
+        fmt.Printf("Record %d written at: %s\n", i+1, pos)
+    }
+
+    // Read back the written records
+    for i, pos := range positions {
+        data, err := wal.Read(pos)
+        if err != nil {
+            log.Printf("Failed to read record %d: %v", i+1, err)
+            continue
+        }
+        fmt.Printf("Read record %d: %s\n", i+1, data)
+    }
+}
+```
+
+- **Automatic Segment Rotation**: If the batch doesn't fit in the current segment, WriteBatch automatically handles rotation and continues writing to the new segment
+
+
 ### Log Tailing (Continuous Reading)
 
-This example demonstrates how to continuously tail the WAL, similar to `tail -f`. It's useful for replication, streaming, or real-time processing scenarios.
+You can continuously tail the WAL, similar to `tail -f`. It's useful for replication, streaming, or real-time processing scenarios.
 
 ```go
 package main
@@ -152,7 +205,7 @@ func main() {
 
 ### Tailing from a Specific Position
 
-This example shows how to tail the WAL starting from a specific position, useful for resuming replication or processing from a known checkpoint.
+You can also tail the WAL starting from a specific position, useful for resuming replication or processing from a known checkpoint.
 
 ```go
 package main
@@ -369,4 +422,4 @@ walfs draws inspiration from production-proven WAL implementations and incorpora
 
 - **Trailer Marker Concept**: Inspired by [etcd issue #6191](https://github.com/etcd-io/etcd/issues/6191#issuecomment-240268979) - detecting torn writes with canary markers
 - **Alignment Strategy**: Influenced by [BoltDB issue #548](https://github.com/boltdb/bolt/issues/548) - reducing partial writes across page boundaries
-- **Memory-Mapped I/O**: Built on the proven [mmap-go](https://github.com/edsrzf/mmap-go) library for efficient file access
+
