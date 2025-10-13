@@ -944,7 +944,7 @@ func TestSegmentReader_CleanupFallback(t *testing.T) {
 	assert.True(t, seg.markedForDeletion.Load())
 
 	// dropping reader reference, with-out close
-	reader = nil
+	runtime.KeepAlive(reader)
 	// forcing two gc cycle.
 	// https://go.dev/blog/cleanups-and-weak
 	// runtime.Finalizer takes at a minimum two full garbage collection cycles to reclaim the memory
@@ -1085,7 +1085,7 @@ func TestSegmentReader_GCDecrementsRefOnlyOnce(t *testing.T) {
 
 		assert.Equal(t, initialRef+1, seg.refCount.Load())
 
-		reader = nil
+		runtime.KeepAlive(reader)
 	}()
 
 	runtime.GC()

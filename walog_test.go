@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ankur-anand/unisondb/pkg/walfs"
+	"github.com/ankur-anand/walfs"
 	"github.com/stretchr/testify/assert"
 )
 
