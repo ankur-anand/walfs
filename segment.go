@@ -114,6 +114,16 @@ type SegmentHeader struct {
 	_ uint32
 }
 
+/* Record Layout:
+┌──────────────────────────────────────────────────────────────┐
+│ 0..3   CRC32C(header[4:8] || data)                           │
+│ 4..7   u32 length                                            │
+│ 8..(8+len-1)   data                                          │
+│ (8+len)..(16+len-1)  trailer 0xDEADBEEFFEEDFACE              │
+│ ... zero padding to next 8-byte boundary                     │
+└──────────────────────────────────────────────────────────────┘
+*/
+
 func decodeSegmentHeader(buf []byte) (*SegmentHeader, error) {
 	if len(buf) < 64 {
 		return nil, io.ErrUnexpectedEOF
