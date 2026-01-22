@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,19 @@ var (
 type DeletionPredicate func(segID SegmentID) bool
 
 type WALogOptions func(*WALog)
+
+// DirectorySyncer syncs a directory path to stable storage.
+type DirectorySyncer interface {
+	SyncDir(dir string) error
+}
+
+// DirectorySyncFunc adapts a function to act as a DirectorySyncer.
+type DirectorySyncFunc func(dir string) error
+
+// SyncDir implements DirectorySyncer.
+func (f DirectorySyncFunc) SyncDir(dir string) error {
+	return f(dir)
+}
 
 // WithMaxSegmentSize options sets the MaxSize of the Segment file.
 func WithMaxSegmentSize(size int64) WALogOptions {
@@ -85,6 +99,49 @@ func WithAutoCleanupPolicy(maxAge time.Duration, minSegments, maxSegments int, e
 	}
 }
 
+// WithDirectorySyncer overrides the directory syncer used for new segment files.
+func WithDirectorySyncer(syncer DirectorySyncer) WALogOptions {
+	return func(sm *WALog) {
+		if syncer != nil {
+			sm.dirSyncer = syncer
+		}
+	}
+}
+
+// WithClearIndexOnFlush enables clearing segment's in-memory index after it's flushed to disk.
+// This is useful when an external index is maintained.
+func WithClearIndexOnFlush() WALogOptions {
+	return func(sm *WALog) {
+		sm.clearIndexOnFlush = true
+	}
+}
+
+// WithReaderCommitCheck enables commit offset checking for readers.
+// When enabled, readers will check against the committed position before advancing.
+// If the reader's current position is at or beyond the committed position,
+// Next() returns ErrNoNewData without advancing.
+// Use Commit() to advance the committed position.
+// This is used in Raft mode where writes are not visible until committed.
+func WithReaderCommitCheck() WALogOptions {
+	return func(sm *WALog) {
+		sm.readerCommitCheck = true
+	}
+}
+
+// WithCustomMarker sets the 4-byte marker written to new segments.
+func WithCustomMarker(marker uint32) WALogOptions {
+	return func(sm *WALog) {
+		sm.customMarker = marker
+	}
+}
+
+// WithCustomMarkerValidator sets a validator for stored markers on open.
+func WithCustomMarkerValidator(validator MarkerValidator) WALogOptions {
+	return func(sm *WALog) {
+		sm.markerValidator = validator
+	}
+}
+
 // WALog manages the lifecycle of each individual segments, including creation, rotation,
 // recovery, and read/write operations.
 type WALog struct {
@@ -111,12 +168,26 @@ type WALog struct {
 	// optimizes the read path and prevent Read-Stall Lock in hot path.
 	segmentSnapshot atomic.Pointer[[]*Segment]
 
+	// committedPos is the logical boundary for readers when readerCommitCheck is enabled.
+	// Readers cannot advance beyond this position.
+	// In Raft mode, FSM.Apply() updates this via Commit() after Raft consensus.
+	committedPos atomic.Pointer[RecordPosition]
+	// readerCommitCheck when true, readers check committed position before advancing.
+	// Set to true for Raft mode where writes are not visible until committed.
+	readerCommitCheck bool
+
 	segmentMaxAge       time.Duration
 	minSegmentsToRetain int
 	maxSegmentsToRetain int
 	enableAutoCleanup   bool
 	deletionMu          sync.Mutex
 	pendingDeletion     map[SegmentID]*Segment
+	dirSyncer           DirectorySyncer
+	clearIndexOnFlush   bool
+	logIndex            *ShardedIndex
+
+	customMarker    uint32
+	markerValidator MarkerValidator
 }
 
 // NewWALog returns an initialized WALog that manages the segments in the provided dir with the given ext.
@@ -138,6 +209,8 @@ func NewWALog(dir string, ext string, opts ...WALogOptions) (*WALog, error) {
 		enableAutoCleanup:   false,
 		pendingDeletion:     make(map[SegmentID]*Segment),
 		rotationCallback:    func() {},
+		dirSyncer:           DirectorySyncFunc(syncDir),
+		logIndex:            NewShardedIndex(),
 	}
 
 	for _, opt := range opts {
@@ -154,7 +227,46 @@ func NewWALog(dir string, ext string, opts ...WALogOptions) (*WALog, error) {
 
 // openSegment opens segment with the provided ID.
 func (wl *WALog) openSegment(id uint32) (*Segment, error) {
-	return OpenSegmentFile(wl.dir, wl.ext, id, WithSegmentSize(wl.maxSegmentSize), WithSyncOption(wl.forceSyncEveryWrite))
+	segmentPath := SegmentFileName(wl.dir, wl.ext, id)
+
+	isNew, err := isNewSegment(segmentPath)
+	if err != nil {
+		return nil, fmt.Errorf("checking segment %d state: %w", id, err)
+	}
+
+	opts := []func(*Segment){
+		WithSegmentSize(wl.maxSegmentSize),
+		WithSyncOption(wl.forceSyncEveryWrite),
+		WithSegmentDirectorySyncer(wl.dirSyncer),
+	}
+	if wl.clearIndexOnFlush {
+		opts = append(opts, withClearIndexOnFlush())
+	}
+
+	if wl.logIndex != nil {
+		opts = append(opts, withLogIndex(wl.logIndex))
+	}
+
+	if wl.customMarker != 0 {
+		opts = append(opts, WithSegmentCustomMarker(wl.customMarker))
+	}
+	if wl.markerValidator != nil {
+		opts = append(opts, WithSegmentCustomMarkerValidator(wl.markerValidator))
+	}
+
+	seg, err := OpenSegmentFile(wl.dir, wl.ext, id, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	if isNew {
+		if err := wl.dirSyncer.SyncDir(wl.dir); err != nil {
+			_ = seg.Close()
+			return nil, fmt.Errorf("fsync wal directory: %w", err)
+		}
+	}
+
+	return seg, nil
 }
 
 func (wl *WALog) recoverSegments() error {
@@ -248,6 +360,24 @@ func (wl *WALog) Sync() error {
 	return nil
 }
 
+// Commit advances the committed position to the given position.
+// When readerCommitCheck is enabled, readers cannot advance beyond this position.
+// In Raft mode, call this after Raft consensus confirms the log entry.
+// This method is safe for concurrent use.
+func (wl *WALog) Commit(pos RecordPosition) {
+	wl.committedPos.Store(&pos)
+}
+
+// CommittedPosition returns the current committed position.
+// Returns NilRecordPosition if no position has been committed yet.
+func (wl *WALog) CommittedPosition() RecordPosition {
+	pos := wl.committedPos.Load()
+	if pos == nil {
+		return NilRecordPosition
+	}
+	return *pos
+}
+
 // Close gracefully shuts down all segments managed by the WALog.
 func (wl *WALog) Close() error {
 	wl.writeMu.Lock()
@@ -259,12 +389,18 @@ func (wl *WALog) Close() error {
 			cErr = errors.Join(cErr, err)
 		}
 	}
+
+	if wl.dirSyncer != nil {
+		if err := wl.dirSyncer.SyncDir(wl.dir); err != nil {
+			cErr = errors.Join(cErr, fmt.Errorf("fsync wal directory: %w", err))
+		}
+	}
 	return cErr
 }
 
 // Write appends the given data as a new record to the active segment.
 // It returns RecordPosition indicating where the data was written.
-func (wl *WALog) Write(data []byte) (RecordPosition, error) {
+func (wl *WALog) Write(data []byte, logIndex uint64) (RecordPosition, error) {
 	wl.writeMu.Lock()
 	defer wl.writeMu.Unlock()
 
@@ -284,9 +420,13 @@ func (wl *WALog) Write(data []byte) (RecordPosition, error) {
 		}
 	}
 
-	pos, err := wl.currentSegment.Write(data)
+	pos, err := wl.currentSegment.Write(data, logIndex)
 	if err != nil {
 		return RecordPosition{}, fmt.Errorf("write failed: %w", err)
+	}
+
+	if logIndex > 0 {
+		wl.logIndex.Set(logIndex, pos)
 	}
 
 	wl.unSynced += estimatedSize
@@ -305,7 +445,7 @@ func (wl *WALog) Write(data []byte) (RecordPosition, error) {
 // WriteBatch appends multiple records to the active segment in a single batched operation.
 // If the batch cannot fit entirely in the current segment, it handles automatic rotation:
 // Returns a slice of RecordPositions for all successfully written records.
-func (wl *WALog) WriteBatch(records [][]byte) ([]RecordPosition, error) {
+func (wl *WALog) WriteBatch(records [][]byte, logIndexes []uint64) ([]RecordPosition, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -326,11 +466,18 @@ func (wl *WALog) WriteBatch(records [][]byte) ([]RecordPosition, error) {
 		}
 	}
 
+	return wl.writeBatchLocked(records, logIndexes)
+}
+
+// nolint:gocognit
+func (wl *WALog) writeBatchLocked(records [][]byte, logIndexes []uint64) ([]RecordPosition, error) {
 	var allPositions []RecordPosition
 	remaining := records
+	remainingIndexes := logIndexes
+	indexOffset := 0
 
 	for len(remaining) > 0 {
-		positions, written, batchErr := wl.currentSegment.WriteBatch(remaining)
+		positions, written, batchErr := wl.currentSegment.WriteBatch(remaining, remainingIndexes)
 
 		if batchErr != nil && !errors.Is(batchErr, ErrSegmentFull) {
 			return allPositions, batchErr
@@ -338,6 +485,15 @@ func (wl *WALog) WriteBatch(records [][]byte) ([]RecordPosition, error) {
 
 		// successfully written positions
 		allPositions = append(allPositions, positions...)
+
+		if logIndexes != nil && written > 0 {
+			for i := 0; i < written; i++ {
+				idx := logIndexes[indexOffset+i]
+				if idx > 0 {
+					wl.logIndex.Set(idx, positions[i])
+				}
+			}
+		}
 
 		// unsynced bytes counter
 		for i := 0; i < written; i++ {
@@ -362,7 +518,11 @@ func (wl *WALog) WriteBatch(records [][]byte) ([]RecordPosition, error) {
 		//
 		// segment is full - rotate and continue with remaining records
 		if errors.Is(batchErr, ErrSegmentFull) && written < len(remaining) {
+			indexOffset += written
 			remaining = remaining[written:]
+			if remainingIndexes != nil {
+				remainingIndexes = remainingIndexes[written:]
+			}
 			if rotateErr := wl.rotateSegment(); rotateErr != nil {
 				return allPositions, fmt.Errorf("failed to rotate segment during batch write: %w", rotateErr)
 			}
@@ -435,6 +595,24 @@ func (wl *WALog) Current() *Segment {
 	return wl.currentSegment
 }
 
+// LogIndex returns the shared sharded index mapping log index to record position.
+func (wl *WALog) LogIndex() *ShardedIndex {
+	return wl.logIndex
+}
+
+// PositionForIndex returns the RecordPosition for the given log index.
+func (wl *WALog) PositionForIndex(idx uint64) (RecordPosition, error) {
+	if wl.logIndex == nil {
+		return NilRecordPosition, errors.New("log index not initialized")
+	}
+
+	pos, ok := wl.logIndex.Get(idx)
+	if !ok {
+		return NilRecordPosition, fmt.Errorf("log index %d not found", idx)
+	}
+	return pos, nil
+}
+
 // RotateSegment rotates the current segment and create a new active segment.
 func (wl *WALog) RotateSegment() error {
 	wl.writeMu.Lock()
@@ -471,6 +649,329 @@ func (wl *WALog) rotateSegment() error {
 	wl.segmentRotated.Add(1)
 	wl.snapshotSegments()
 	wl.rotationCallback()
+	return nil
+}
+
+// Truncate truncates the WAL to the specified log index.
+// All entries after the given log index will be discarded.
+// If logIndex is 0, all segments are deleted and the WAL is reset.
+//
+// Users must ensure that reader creation and advancement are not interfering
+// with the truncation logic. Active readers on segments that need to be
+// deleted will cause the Truncate operation to fail.
+func (wl *WALog) Truncate(logIndex uint64) error {
+	wl.writeMu.Lock()
+	defer wl.writeMu.Unlock()
+
+	plan, err := wl.buildTruncatePlan(logIndex)
+	if err != nil {
+		return err
+	}
+
+	if logIndex == 0 && plan.hasActiveReaders {
+		return errors.New("cannot truncate WAL to 0 while active readers exist")
+	}
+
+	if err := wl.deleteSegments(plan.segmentsToDelete); err != nil {
+		return err
+	}
+
+	if logIndex == 0 {
+		return wl.resetAfterFullTruncate(plan.segmentToTruncate)
+	}
+
+	if plan.segmentToTruncate != 0 {
+		seg := wl.segments[plan.segmentToTruncate]
+		if err := seg.TruncateTo(logIndex); err != nil {
+			return fmt.Errorf("failed to truncate segment %d: %w", plan.segmentToTruncate, err)
+		}
+		wl.currentSegment = seg
+		// delete index entries beyond truncation point
+		_, last, ok := wl.logIndex.GetFirstLast()
+		if ok && last > logIndex {
+			wl.logIndex.DeleteRange(logIndex+1, last)
+		}
+	} else if len(wl.segments) == 0 {
+		seg, err := wl.openSegment(1)
+		if err != nil {
+			return fmt.Errorf("failed to create initial segment after truncate: %w", err)
+		}
+		wl.segments[1] = seg
+		wl.currentSegment = seg
+		wl.snapshotSegments()
+		return nil
+	}
+
+	wl.snapshotSegments()
+
+	return nil
+}
+
+type truncatePlan struct {
+	segmentsToDelete  []SegmentID
+	segmentToTruncate SegmentID
+	earliestIndex     uint64
+	haveEarliest      bool
+	hasActiveReaders  bool
+}
+
+func (wl *WALog) buildTruncatePlan(logIndex uint64) (truncatePlan, error) {
+	var plan truncatePlan
+
+	for id, seg := range wl.segments {
+		if seg.HasActiveReaders() {
+			plan.hasActiveReaders = true
+		}
+
+		first := seg.FirstLogIndex()
+		if first > 0 && (!plan.haveEarliest || first < plan.earliestIndex) {
+			plan.earliestIndex = first
+			plan.haveEarliest = true
+		}
+
+		if first > logIndex {
+			plan.segmentsToDelete = append(plan.segmentsToDelete, id)
+			continue
+		}
+
+		if plan.segmentToTruncate == 0 || first > wl.segments[plan.segmentToTruncate].FirstLogIndex() {
+			plan.segmentToTruncate = id
+		}
+	}
+
+	if logIndex > 0 && plan.haveEarliest && logIndex < plan.earliestIndex {
+		return plan, fmt.Errorf("truncate index %d is before earliest segment index %d", logIndex, plan.earliestIndex)
+	}
+
+	// active readers on deletion candidates ?
+	for _, id := range plan.segmentsToDelete {
+		seg := wl.segments[id]
+		if seg.HasActiveReaders() {
+			return plan, fmt.Errorf("cannot delete segment %d: has active readers", id)
+		}
+	}
+
+	// active readers on target segment ONLY if fully deleting ?
+	if plan.segmentToTruncate != 0 {
+		seg := wl.segments[plan.segmentToTruncate]
+		if logIndex == 0 {
+			if seg.HasActiveReaders() {
+				return plan, fmt.Errorf("cannot delete segment %d: has active readers", plan.segmentToTruncate)
+			}
+		}
+	}
+
+	return plan, nil
+}
+
+func (wl *WALog) deleteSegments(ids []SegmentID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	for _, id := range ids {
+		seg := wl.segments[id]
+		// delete index entries for this segment from ShardedIndex
+		firstIdx := seg.FirstLogIndex()
+		entryCount := seg.GetEntryCount()
+		if firstIdx > 0 && entryCount > 0 {
+			lastIdx := firstIdx + uint64(entryCount) - 1
+			wl.logIndex.DeleteRange(firstIdx, lastIdx)
+		}
+		if err := seg.Remove(); err != nil {
+			return fmt.Errorf("failed to remove segment %d: %w", id, err)
+		}
+		delete(wl.segments, id)
+		if wl.currentSegment != nil && wl.currentSegment.ID() == id {
+			wl.currentSegment = nil
+		}
+	}
+	return nil
+}
+
+func (wl *WALog) resetAfterFullTruncate(segmentToTruncate SegmentID) error {
+	if segmentToTruncate != 0 {
+		seg := wl.segments[segmentToTruncate]
+		if err := seg.Remove(); err != nil {
+			return fmt.Errorf("failed to remove segment %d: %w", segmentToTruncate, err)
+		}
+		delete(wl.segments, segmentToTruncate)
+		if wl.currentSegment != nil && wl.currentSegment.ID() == segmentToTruncate {
+			wl.currentSegment = nil
+		}
+	}
+
+	wl.logIndex.Clear()
+	wl.snapshotSegments()
+
+	seg, err := wl.openSegment(1)
+	if err != nil {
+		return fmt.Errorf("failed to create initial segment after truncate: %w", err)
+	}
+	wl.segments[1] = seg
+	wl.currentSegment = seg
+	wl.snapshotSegments()
+	return nil
+}
+
+// BackupLastRotatedSegment copies the most recently sealed WAL segment into backupDir and returns the backup path.
+func (wl *WALog) BackupLastRotatedSegment(backupDir string) (string, error) {
+	if backupDir == "" {
+		return "", errors.New("backup directory cannot be empty")
+	}
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create backup directory: %w", err)
+	}
+
+	wl.writeMu.RLock()
+	if wl.currentSegment == nil {
+		wl.writeMu.RUnlock()
+		return "", errors.New("no active segment")
+	}
+	if wl.currentSegment.ID() <= 1 {
+		wl.writeMu.RUnlock()
+		return "", fmt.Errorf("%w: no rotated segment available", ErrSegmentNotFound)
+	}
+
+	lastID := wl.currentSegment.ID() - 1
+	segment, ok := wl.segments[lastID]
+	if !ok {
+		wl.writeMu.RUnlock()
+		return "", fmt.Errorf("%w: segment %d", ErrSegmentNotFound, lastID)
+	}
+
+	segment.incrRef()
+	wl.writeMu.RUnlock()
+	defer segment.releaseRef()
+
+	if !segment.IsInMemorySealed() && !IsSealed(segment.GetFlags()) {
+		return "", fmt.Errorf("segment %d has not been sealed yet", segment.ID())
+	}
+
+	srcPath := segment.path
+	dstPath := filepath.Join(backupDir, filepath.Base(srcPath))
+	if filepath.Clean(srcPath) == filepath.Clean(dstPath) {
+		return "", errors.New("backup destination must differ from WAL directory")
+	}
+
+	if err := copySegmentFile(srcPath, dstPath, wl.dirSyncer); err != nil {
+		return "", fmt.Errorf("backup segment %d: %w", segment.ID(), err)
+	}
+
+	return dstPath, nil
+}
+
+// BackupSegmentsAfter copies every sealed segment with ID > afterID into backupDir.
+// Returns a map of SegmentID to the backup file path.
+func (wl *WALog) BackupSegmentsAfter(afterID SegmentID, backupDir string) (map[SegmentID]string, error) {
+	if backupDir == "" {
+		return nil, errors.New("backup directory cannot be empty")
+	}
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create backup directory: %w", err)
+	}
+
+	wl.writeMu.RLock()
+	var (
+		targets   []*Segment
+		currentID SegmentID
+	)
+	if wl.currentSegment != nil {
+		currentID = wl.currentSegment.ID()
+	}
+	for id, seg := range wl.segments {
+		if id <= afterID {
+			continue
+		}
+		if id == currentID && !seg.IsInMemorySealed() && !IsSealed(seg.GetFlags()) {
+			continue
+		}
+		seg.incrRef()
+		targets = append(targets, seg)
+	}
+	wl.writeMu.RUnlock()
+
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("%w: no segments after %d", ErrSegmentNotFound, afterID)
+	}
+
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].ID() < targets[j].ID()
+	})
+
+	defer func() {
+		for _, seg := range targets {
+			seg.releaseRef()
+		}
+	}()
+
+	backups := make(map[SegmentID]string, len(targets))
+
+	for _, seg := range targets {
+		if !seg.IsInMemorySealed() && !IsSealed(seg.GetFlags()) {
+			return nil, fmt.Errorf("segment %d has not been sealed yet", seg.ID())
+		}
+
+		srcPath := seg.path
+		dstPath := filepath.Join(backupDir, filepath.Base(srcPath))
+		if filepath.Clean(srcPath) == filepath.Clean(dstPath) {
+			return nil, errors.New("backup destination must differ from WAL directory")
+		}
+
+		if err := copySegmentFile(srcPath, dstPath, wl.dirSyncer); err != nil {
+			return nil, fmt.Errorf("backup segment %d: %w", seg.ID(), err)
+		}
+
+		backups[seg.ID()] = dstPath
+	}
+
+	return backups, nil
+}
+
+func copySegmentFile(srcPath, dstPath string, syncer DirectorySyncer) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open source segment: %w", err)
+	}
+	defer src.Close()
+
+	tmpPath := dstPath + ".tmp"
+	dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fileModePerm)
+	if err != nil {
+		return fmt.Errorf("create temp backup: %w", err)
+	}
+
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("copy contents: %w", err)
+	}
+
+	if err := dst.Sync(); err != nil {
+		dst.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("sync backup: %w", err)
+	}
+
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close backup: %w", err)
+	}
+
+	_ = os.Remove(dstPath)
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize backup: %w", err)
+	}
+
+	dir := filepath.Dir(dstPath)
+	if syncer == nil {
+		syncer = DirectorySyncFunc(syncDir)
+	}
+	if err := syncer.SyncDir(dir); err != nil {
+		return fmt.Errorf("sync backup directory: %w", err)
+	}
+
 	return nil
 }
 
@@ -571,6 +1072,7 @@ func (wl *WALog) MarkSegmentsForDeletion() {
 		}
 		if _, alreadyQueued := wl.pendingDeletion[seg.ID()]; !alreadyQueued {
 			wl.pendingDeletion[seg.ID()] = seg
+			seg.MarkForDeletion()
 			segmentsToDelete--
 		}
 	}
@@ -617,27 +1119,62 @@ func (wl *WALog) CleanupStalePendingSegments() {
 	wl.writeMu.Unlock()
 }
 
+// https://man7.org/linux/man-pages/man2/fsync.2.html
+// Calling fsync() does not necessarily ensure that the entry in the
+// directory containing the file has also reached disk.  For that an
+// explicit fsync() on a file descriptor for the directory is also
+// needed.
+func syncDir(dir string) error {
+	df, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer df.Close()
+	return df.Sync()
+}
+
+// ReaderOption configures a Reader.
+type ReaderOption func(*Reader)
+
+// WithDecoder sets a custom decoder for the reader.
+// When set, NextRecord() will use this decoder to convert raw bytes to decoded data.
+func WithDecoder(decoder RecordDecoder) ReaderOption {
+	return func(r *Reader) {
+		r.decoder = decoder
+	}
+}
+
 // Reader represents a high-level sequential reader over a WALog.
 // It reads across all available WAL segments in order, automatically
 // advancing from one segment to the next.
 // Reader is not safe for concurrent use.
 type Reader struct {
+	wal      *WALog
 	segments []*Segment
 	// index in segments
 	segmentIndex  int
 	currentReader *SegmentReader
 	startOffset   int64
+	decoder       RecordDecoder
 }
 
 // NewReader returns a new Reader that sequentially reads all segments in the WALog,
 // starting from the beginning (lowest SegmentID).
-func (wl *WALog) NewReader() *Reader {
+func (wl *WALog) NewReader(opts ...ReaderOption) *Reader {
 	segments := *wl.segmentSnapshot.Load()
 
-	return &Reader{
+	r := &Reader{
+		wal:           wl,
 		segments:      segments,
 		currentReader: nil,
+		decoder:       NoopDecoder{},
 	}
+
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
 }
 
 // Close closes all segment readers to release their references.
@@ -651,6 +1188,8 @@ func (r *Reader) Close() {
 // Next returns the next available WAL record data and its current position.
 // IMPORTANT: The returned `[]byte` is a slice of a memory-mapped file, so data must not be retained or modified.
 // If the data needs to be used beyond the lifetime of the segment, the caller MUST copy it.
+// When readerCommitCheck is enabled on the WALog, returns ErrNoNewData if the reader
+// has reached the committed boundary.
 func (r *Reader) Next() ([]byte, RecordPosition, error) {
 	for {
 		// no current segment reader, it advances to the next segment in r.segments until all are exhausted.
@@ -672,10 +1211,23 @@ func (r *Reader) Next() ([]byte, RecordPosition, error) {
 			r.currentReader = reader
 		}
 
+		// Check committed boundary before reading.
+		// If readerCommitCheck is enabled and we're at or beyond the committed position,
+		// return ErrNoNewData without advancing.
+		if r.wal != nil && r.wal.readerCommitCheck {
+			if r.isAtOrBeyondCommitted() {
+				return nil, NilRecordPosition, ErrNoNewData
+			}
+		}
+
 		reader := r.currentReader
 		data, pos, err := reader.Next()
 		if err == nil {
-			return data, pos, nil
+			decoded, decErr := r.decoder.Decode(data)
+			if decErr != nil {
+				return nil, pos, decErr
+			}
+			return decoded, pos, nil
 		}
 		// the current segment is exhausted, moves to the next segment.
 		if errors.Is(err, io.EOF) {
@@ -685,6 +1237,35 @@ func (r *Reader) Next() ([]byte, RecordPosition, error) {
 		}
 		return nil, NilRecordPosition, err
 	}
+}
+
+// isAtOrBeyondCommitted checks if the reader's current position is at or beyond
+// the committed position. Returns true if reader should not advance further.
+func (r *Reader) isAtOrBeyondCommitted() bool {
+	committed := r.wal.committedPos.Load()
+	if committed == nil {
+		// No committed position yet - nothing to read
+		return true
+	}
+
+	// Get the current read position
+	// current segment (segmentIndex was already incremented)
+	seg := r.segments[r.segmentIndex-1]
+	nextPos := RecordPosition{
+		SegmentID: seg.ID(),
+		Offset:    r.currentReader.readOffset,
+	}
+
+	// Reader is beyond committed if:
+	// - segment ID > committed segment ID, OR
+	// - same segment but offset > committed offset
+	if nextPos.SegmentID > committed.SegmentID {
+		return true
+	}
+	if nextPos.SegmentID == committed.SegmentID && nextPos.Offset > committed.Offset {
+		return true
+	}
+	return false
 }
 
 // SeekNext advances the reader by one record, discarding the data.
@@ -700,8 +1281,8 @@ func (r *Reader) LastRecordPosition() RecordPosition {
 
 // NewReaderAfter returns a reader that starts after the given RecordPosition.
 // It first creates a reader from that position, then skips one record.
-func (wl *WALog) NewReaderAfter(pos RecordPosition) (*Reader, error) {
-	reader, err := wl.NewReaderWithStart(pos)
+func (wl *WALog) NewReaderAfter(pos RecordPosition, opts ...ReaderOption) (*Reader, error) {
+	reader, err := wl.NewReaderWithStart(pos, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -713,9 +1294,9 @@ func (wl *WALog) NewReaderAfter(pos RecordPosition) (*Reader, error) {
 
 // NewReaderWithStart returns a new Reader that begins reading from the specified position.
 // If SegmentID is 0, the reader will begin from the very start of the WAL.
-func (wl *WALog) NewReaderWithStart(pos RecordPosition) (*Reader, error) {
+func (wl *WALog) NewReaderWithStart(pos RecordPosition, opts ...ReaderOption) (*Reader, error) {
 	if pos.SegmentID == 0 {
-		return wl.NewReader(), nil
+		return wl.NewReader(opts...), nil
 	}
 
 	segments := *wl.segmentSnapshot.Load()
@@ -729,7 +1310,7 @@ func (wl *WALog) NewReaderWithStart(pos RecordPosition) (*Reader, error) {
 	for i := len(segments) - 1; i >= 0; i-- {
 		seg := segments[i]
 		if seg.ID() < pos.SegmentID {
-			// we’ve gone past the matching segment; stop
+			// we've gone past the matching segment; stop
 			break
 		}
 		if seg.ID() == pos.SegmentID {
@@ -749,9 +1330,17 @@ func (wl *WALog) NewReaderWithStart(pos RecordPosition) (*Reader, error) {
 		return nil, ErrSegmentNotFound
 	}
 
-	return &Reader{
+	r := &Reader{
+		wal:           wl,
 		segments:      filtered,
 		startOffset:   startOffset,
 		currentReader: nil,
-	}, nil
+		decoder:       NoopDecoder{},
+	}
+
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r, nil
 }
